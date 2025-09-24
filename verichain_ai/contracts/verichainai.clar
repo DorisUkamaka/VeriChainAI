@@ -14,6 +14,9 @@
 (define-constant ERR-ALREADY-VOTED (err u106))
 (define-constant ERR-VOTING-PERIOD-ENDED (err u107))
 (define-constant ERR-INVALID-SCORE (err u108))
+(define-constant ERR-VOTING-STILL-ACTIVE (err u109))
+(define-constant ERR-ALREADY-FINALIZED (err u110))
+(define-constant ERR-NO-VOTES (err u111))
 
 ;; Contract constants
 (define-constant CONTRACT-OWNER tx-sender)
@@ -23,6 +26,8 @@
 (define-constant VOTING-PERIOD-BLOCKS u2016) ;; ~14 days at 10min/block
 (define-constant MAX-QUALITY-SCORE u100)
 (define-constant MIN-QUALITY-SCORE u0)
+(define-constant CONSENSUS-THRESHOLD u10) ;; 10% deviation for consensus
+(define-constant SLASHING-RATE u20) ;; 20% slashing for bad actors
 
 ;; Data variables
 (define-data-var next-dataset-id uint u1)
@@ -67,6 +72,32 @@
 
 ;; Total curator stakes
 (define-map curator-total-stakes principal uint)
+
+;; Final consensus scores for completed datasets
+(define-map final-scores 
+  uint 
+  {
+    overall-score: uint,
+    quality-score: uint,
+    accuracy-score: uint,
+    bias-score: uint,
+    documentation-score: uint,
+    license-clarity-score: uint,
+    total-rewards-distributed: uint,
+    finalized-at: uint
+  }
+)
+
+;; Curator reputation tracking
+(define-map curator-reputation 
+  principal 
+  {
+    successful-votes: uint,
+    total-votes: uint,
+    total-rewards-earned: uint,
+    reputation-score: uint
+  }
+)
 
 ;; Public function to list a new dataset
 (define-public (list-dataset (dataset-hash (buff 64)) (bounty-amount uint) (metadata-uri (string-ascii 255)))
@@ -235,6 +266,156 @@
     dataset (some (+ (get created-at dataset) VOTING-PERIOD-BLOCKS))
     none
   )
+)
+
+;; Public function to finalize dataset and distribute rewards
+(define-public (finalize-dataset (dataset-id uint))
+  (let (
+    (dataset (unwrap! (map-get? datasets dataset-id) ERR-DATASET-NOT-FOUND))
+    (voting-deadline (+ (get created-at dataset) VOTING-PERIOD-BLOCKS))
+    (stakes-list (default-to (list) (map-get? dataset-stakes dataset-id)))
+  )
+    ;; Validate conditions
+    (asserts! (> block-height voting-deadline) ERR-VOTING-STILL-ACTIVE)
+    (asserts! (is-none (map-get? final-scores dataset-id)) ERR-ALREADY-FINALIZED)
+    (asserts! (> (get vote-count dataset) u0) ERR-NO-VOTES)
+    
+    ;; Calculate consensus scores
+    (let (
+      (consensus-result (calculate-consensus-scores dataset-id stakes-list))
+      (overall-score (get overall-score consensus-result))
+      (quality-score (get quality-score consensus-result))
+      (accuracy-score (get accuracy-score consensus-result))
+      (bias-score (get bias-score consensus-result))
+      (documentation-score (get documentation-score consensus-result))
+      (license-clarity-score (get license-clarity-score consensus-result))
+      (total-rewards (+ (get bounty-amount dataset) (/ (get total-stake dataset) u10))) ;; bounty + 10% of stakes as rewards
+    )
+      
+      ;; Store final scores
+      (map-set final-scores dataset-id {
+        overall-score: overall-score,
+        quality-score: quality-score,
+        accuracy-score: accuracy-score,
+        bias-score: bias-score,
+        documentation-score: documentation-score,
+        license-clarity-score: license-clarity-score,
+        total-rewards-distributed: total-rewards,
+        finalized-at: block-height
+      })
+      
+      ;; Distribute rewards and update reputations
+      (try! (distribute-rewards dataset-id stakes-list consensus-result total-rewards))
+      
+      ;; Update dataset status
+      (map-set datasets dataset-id (merge dataset {
+        status: "completed"
+      }))
+      
+      (ok overall-score)
+    )
+  )
+)
+
+;; Read-only function to get final scores
+(define-read-only (get-final-scores (dataset-id uint))
+  (map-get? final-scores dataset-id)
+)
+
+;; Read-only function to get curator reputation
+(define-read-only (get-curator-reputation (curator principal))
+  (default-to {successful-votes: u0, total-votes: u0, total-rewards-earned: u0, reputation-score: u0} 
+              (map-get? curator-reputation curator))
+)
+
+;; Private function to calculate consensus scores
+(define-private (calculate-consensus-scores (dataset-id uint) (stakes-list (list 50 {curator: principal, amount: uint})))
+  (let (
+    (total-stake (fold + (map get-stake-amount stakes-list) u0))
+    (weighted-quality (fold + (map (lambda (stake-entry) 
+                                    (let ((vote (unwrap-panic (map-get? votes {dataset-id: dataset-id, curator: (get curator stake-entry)}))))
+                                      (* (get quality-score vote) (get amount stake-entry)))) stakes-list) u0))
+    (weighted-accuracy (fold + (map (lambda (stake-entry) 
+                                     (let ((vote (unwrap-panic (map-get? votes {dataset-id: dataset-id, curator: (get curator stake-entry)}))))
+                                       (* (get accuracy-score vote) (get amount stake-entry)))) stakes-list) u0))
+    (weighted-bias (fold + (map (lambda (stake-entry) 
+                                 (let ((vote (unwrap-panic (map-get? votes {dataset-id: dataset-id, curator: (get curator stake-entry)}))))
+                                   (* (get bias-score vote) (get amount stake-entry)))) stakes-list) u0))
+    (weighted-documentation (fold + (map (lambda (stake-entry) 
+                                          (let ((vote (unwrap-panic (map-get? votes {dataset-id: dataset-id, curator: (get curator stake-entry)}))))
+                                            (* (get documentation-score vote) (get amount stake-entry)))) stakes-list) u0))
+    (weighted-license (fold + (map (lambda (stake-entry) 
+                                    (let ((vote (unwrap-panic (map-get? votes {dataset-id: dataset-id, curator: (get curator stake-entry)}))))
+                                      (* (get license-clarity-score vote) (get amount stake-entry)))) stakes-list) u0))
+  )
+    (let (
+      (quality-consensus (/ weighted-quality total-stake))
+      (accuracy-consensus (/ weighted-accuracy total-stake))
+      (bias-consensus (/ weighted-bias total-stake))
+      (documentation-consensus (/ weighted-documentation total-stake))
+      (license-consensus (/ weighted-license total-stake))
+      (overall-consensus (/ (+ quality-consensus accuracy-consensus bias-consensus documentation-consensus license-consensus) u5))
+    )
+      {
+        overall-score: overall-consensus,
+        quality-score: quality-consensus,
+        accuracy-score: accuracy-consensus,
+        bias-score: bias-consensus,
+        documentation-score: documentation-consensus,
+        license-clarity-score: license-consensus
+      }
+    )
+  )
+)
+
+;; Private function to distribute rewards
+(define-private (distribute-rewards (dataset-id uint) (stakes-list (list 50 {curator: principal, amount: uint})) (consensus-scores {overall-score: uint, quality-score: uint, accuracy-score: uint, bias-score: uint, documentation-score: uint, license-clarity-score: uint}) (total-rewards uint))
+  (let ((platform-fee (/ (* total-rewards (var-get platform-fee-rate)) u10000)))
+    (fold distribute-curator-reward stakes-list {dataset-id: dataset-id, consensus-scores: consensus-scores, remaining-rewards: (- total-rewards platform-fee)})
+    (ok true)
+  )
+)
+
+;; Private helper function for reward distribution
+(define-private (distribute-curator-reward (stake-entry {curator: principal, amount: uint}) (context {dataset-id: uint, consensus-scores: {overall-score: uint, quality-score: uint, accuracy-score: uint, bias-score: uint, documentation-score: uint, license-clarity-score: uint}, remaining-rewards: uint}))
+  (let (
+    (curator (get curator stake-entry))
+    (stake-amount (get amount stake-entry))
+    (dataset-id (get dataset-id context))
+    (consensus (get consensus-scores context))
+    (vote (unwrap-panic (map-get? votes {dataset-id: dataset-id, curator: curator})))
+  )
+    (let (
+      (curator-overall (/ (+ (get quality-score vote) (get accuracy-score vote) (get bias-score vote) (get documentation-score vote) (get license-clarity-score vote)) u5))
+      (deviation (if (> curator-overall (get overall-score consensus)) 
+                     (- curator-overall (get overall-score consensus))
+                     (- (get overall-score consensus) curator-overall)))
+      (is-consensus (< deviation CONSENSUS-THRESHOLD))
+      (reward-amount (if is-consensus (/ (* stake-amount u110) u100) (/ (* stake-amount (- u100 SLASHING-RATE)) u100))) ;; 110% if good, 80% if bad
+    )
+      ;; Transfer reward/slashed amount
+      (unwrap-panic (as-contract (stx-transfer? reward-amount tx-sender curator)))
+      
+      ;; Update curator reputation
+      (let ((current-rep (get-curator-reputation curator)))
+        (map-set curator-reputation curator {
+          successful-votes: (if is-consensus (+ (get successful-votes current-rep) u1) (get successful-votes current-rep)),
+          total-votes: (+ (get total-votes current-rep) u1),
+          total-rewards-earned: (+ (get total-rewards-earned current-rep) reward-amount),
+          reputation-score: (if (> (get total-votes current-rep) u0)
+                               (/ (* (get successful-votes current-rep) u100) (get total-votes current-rep))
+                               u0)
+        })
+      )
+      
+      context
+    )
+  )
+)
+
+;; Private helper functions
+(define-private (get-stake-amount (stake-entry {curator: principal, amount: uint}))
+  (get amount stake-entry)
 )
 
 ;; Private function to find dataset ID by hash (helper function)
